@@ -1159,8 +1159,10 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
     // The shared memory to do the final reduction for the output values. Reuse qk_smem.
     Tk* out_smem = reinterpret_cast<Tk*>(smem_);
 
-    // The shared memory buffers for the block-wide reductions. One for max, one for sum.
-    __shared__ float red_smem[WARPS_PER_BLOCK * 2];
+    // The shared memory buffers for the block-wide reductions. One for max, one for sum, one for min.
+    __shared__ float red_smem[WARPS_PER_BLOCK * 3];
+    // The shared memory buffers for the qk_min index block-wide reduction.
+    __shared__ int red_int_smem[WARPS_PER_BLOCK];
 
     // A vector of Q or K elements for the current timestep.
     using Qk_vec_k = typename Qk_vec_k_<T, Dh_MAX>::Type;  // with kernel-used precision
@@ -1213,6 +1215,8 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
 
     // While doing the product Q*K^T for the different keys we track the max.
     float qk_max = -FLT_MAX;
+    float qk_min = FLT_MAX;
+    int qk_min_idx = -1;
 
     float qk = 0.0F;
 
@@ -1452,6 +1456,8 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
         // We don't need to apply the linear position bias here since qi - ki = 0 yields the position bias 0.
 
         qk_max                        = qk;
+        qk_min                        = qk;
+        qk_min_idx                    = tlength - first_step;  // TODO: Not sure about this yet. Verify.
         qk_smem[tlength - first_step] = qk;
         // qk_smem[params.timestep] = qk;
     }
@@ -1587,7 +1593,13 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
 
                 qk += mul<float, T, float>(params.linear_bias_slopes[hi], dist);
             }
-            qk_max                   = is_mask ? qk_max : fmaxf(qk_max, qk);
+            if (is_mask) {
+                qk_max = fmaxf(qk_max, qk);
+                if (qk_min > qk) {
+                    qk_min_idx = ti - first_step;
+                    qk_min = qk;
+                }
+            }
             qk_smem[ti - first_step] = qk;
         }
     }
@@ -1599,6 +1611,10 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
 #pragma unroll
     for (int mask = WARP_SIZE / 2; mask >= THREADS_PER_KEY; mask /= 2) {
         qk_max = fmaxf(qk_max, __shfl_xor_sync(uint32_t(-1), qk_max, mask));
+        if (qk_min > __shfl_xor_sync(uint32_t(-1), qk_min, mask)) {
+            qk_min_idx = __shfl_xor_sync(uint32_t(-1), qk_min_idx, mask);
+            qk_min = __shfl_xor_sync(uint32_t(-1), qk_min, mask);
+        }
     }
 
     // Decompose the thread index into warp and lane.
@@ -1608,6 +1624,8 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
     // The warp leader writes the max to shared memory.
     if (lane == 0) {
         red_smem[warp] = qk_max;
+        red_int_smem[warp] = qk_min_idx;
+        red_smem[WARPS_PER_BLOCK * 2 + warp] = qk_min;
     }
 
     // Make sure the products are in shared memory.
@@ -1615,13 +1633,20 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
 
     // The warps finalize the reduction.
     qk_max = lane < WARPS_PER_BLOCK ? red_smem[lane] : -FLT_MAX;
+    qk_min_idx = lane < WARPS_PER_BLOCK ? red_int_smem[lane] : -1;
+    qk_min = lane < WARPS_PER_BLOCK ? red_smem[WARPS_PER_BLOCK * 2 + lane] : FLT_MAX;
 #pragma unroll
     for (int mask = WARPS_PER_BLOCK / 2; mask >= 1; mask /= 2) {
         qk_max = fmaxf(qk_max, __shfl_xor_sync(uint32_t(-1), qk_max, mask));
+        if (qk_min > __shfl_xor_sync(uint32_t(-1), qk_min, mask)) {
+            qk_min_idx = __shfl_xor_sync(uint32_t(-1), qk_min_idx, mask);
+            qk_min = __shfl_xor_sync(uint32_t(-1), qk_min, mask);
+        }
     }
 
     // Broadcast to all the threads in the warp.
     qk_max = __shfl_sync(uint32_t(-1), qk_max, 0);
+    qk_min_idx = __shfl_sync(uint32_t(-1), qk_min_idx, 0);
 
     // Compute the logits and start the sum.
     float sum = 0.f;
