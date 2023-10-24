@@ -91,6 +91,10 @@ struct Multihead_attention_params_base {
     bool neox_rotary_style    = false;
     // The maximum length of input sentences.
     int max_input_length = 0;
+    // The fixed budget to store only important kv cache. If <=0, do not limit.
+    int important_kv_max_len = 0;
+    // The recent sequence to ensure kv cache is saved.
+    int important_kv_recent_len = 0;
     // The current timestep. TODO(bhsueh) Check that do we only this param in cross attention?
     int timestep = 0;
     // The current timestep of each sentences (support different timestep for different sentences)
