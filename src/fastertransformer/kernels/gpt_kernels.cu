@@ -27,6 +27,26 @@
 
 namespace fastertransformer {
 
+__global__ void initiate_indices(int* kv_indices, const int loop_size, const size_t total_length)
+{
+    int idx    = threadIdx.x + blockIdx.x * blockDim.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = idx; i < total_length; i += stride) {
+        kv_indices[i] = i % loop_size;
+    }
+}
+
+void invokeInitiateIndices(int*         kv_indices,
+                           const int    loop_size,
+                           const size_t total_length,
+                           cudaStream_t stream)
+{
+    const int block_size = 256;
+    const int grid_size  = min(65535, static_cast<int>((total_length + block_size - 1) / block_size));
+
+    initiate_indices<<<grid_size, block_size, 0, stream>>>(kv_indices, loop_size, total_length);
+}
+
 // PROMPT_SRC: 0 --> no prompts, 1 --> from loaded prompts, 2 --> from request prompts
 template<typename T, bool OUTPUT_ID, int PROMPT_SRC>
 __global__ void start_id_embedding_position_lookups_kernel(T*                    from_tensor,

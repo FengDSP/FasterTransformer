@@ -93,6 +93,10 @@ struct Multihead_attention_params_base {
     bool neox_rotary_style    = false;
     // The maximum length of input sentences.
     int max_input_length = 0;
+    // The number of oldest cache element to pick the least important to replace when cache is full. If 0, it will fall back to circular cache.
+    int important_kv_cache_size = 0;
+    // The buffer to store the indices of the keys and values in the cache. The shape is [B, H, memory_max_len].
+    int* kv_indices = nullptr;
     // The current timestep. TODO(bhsueh) Check that do we only this param in cross attention?
     int timestep = 0;
     // The current timestep of each sentences (support different timestep for different sentences)

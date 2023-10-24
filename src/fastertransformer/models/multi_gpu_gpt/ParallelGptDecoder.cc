@@ -271,11 +271,13 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
     //          is real local_batch_size. (optional.)
     //      masked_tokens [local_batch_size, session_len]
     //      linear_bias_slopes [head_num], optional
+    //      important_kv_cache_size [1] on cpu (optional)
 
     // output tensors:
     //      decoder_output [local_batch_size, hidden_dimension],
     //      key_cache [num_layer, batch_size, head_num, size_per_head // x, memory_len, x]
     //      value_cache [num_layer, batch_size, head_num, memory_len, size_per_head]
+    //      kv_indices [num_layer, batch_size, head_num, memory_len] (optional)
 
     FT_LOG_DEBUG(__PRETTY_FUNCTION__);
 
@@ -298,8 +300,16 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
 
     const int ite = input_tensors->at("ite").getVal<int>();
 
+    const auto important_kv_cache_size_tensor = input_tensors->find("important_kv_cache_size");
+    const size_t important_kv_cache_size =
+        important_kv_cache_size_tensor != input_tensors->end() ?
+            important_kv_cache_size_tensor->second.getVal<size_t>() :
+            0;
+
     Tensor k_cache = output_tensors->at("key_cache");
     Tensor v_cache = output_tensors->at("value_cache");
+
+    const auto kv_indices_tensor = output_tensors->find("kv_indices");
 
     // The resize of the key cache buffer by
     //   (local_batch_size, local_head_num, size_per_head // x, max_seq_len, x) where x is constant.
@@ -309,6 +319,16 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
     // The resize of the value cache buffer by (local_batch_size, local_head_num, max_seq_len, size_per_head).
     std::vector<size_t> self_v_cache_size(v_cache.shape.begin() + 2, v_cache.shape.end());
     self_v_cache_size.insert(self_v_cache_size.begin(), local_batch_size);
+
+    // The resize of the kv_indices buffer by (local_batch_size, local_head_num, important_kv_cache_size).
+    std::vector<size_t> self_kv_indices_size;
+    if (kv_indices_tensor != output_tensors->end()){
+        self_kv_indices_size.insert(
+            self_kv_indices_size.begin(),
+            kv_indices_tensor->second.shape.begin() + 2,
+            kv_indices_tensor->second.shape.end());
+        self_kv_indices_size.insert(self_kv_indices_size.begin(), local_batch_size);
+    }
 
     const auto activation_in_type  = int8_mode_ == 2 ? TYPE_INT8 : data_type;
     const auto activation_out_type = data_type;
@@ -368,7 +388,9 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
             {"total_padding_tokens", input_tensors->at("total_padding_tokens")},
             {"max_input_length", input_tensors->at("max_input_length")},
             {"step", input_tensors->at("step")},
-            {"masked_tokens", input_tensors->at("masked_tokens")}};
+            {"masked_tokens", input_tensors->at("masked_tokens")},
+            {"important_kv_cache_size", input_tensors->at("important_kv_cache_size")},
+            };
         if (input_tensors->count("cache_indirection")) {
             self_attention_input_tensors.insert("cache_indirection", input_tensors->at("cache_indirection"));
         }
@@ -392,6 +414,27 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
             {"key_cache", Tensor(MEMORY_GPU, data_type, self_k_cache_size, k_cache.getPtrWithOffset<T>(cache_offset))},
             {"value_cache",
              Tensor(MEMORY_GPU, data_type, self_v_cache_size, v_cache.getPtrWithOffset<T>(cache_offset))}};
+        if (kv_indices_tensor != output_tensors->end()){
+            size_t kv_indices_offset = l - getFirstLayerParallelId();
+            for (auto t = kv_indices_tensor->second.shape.begin() + 1;
+                 t != kv_indices_tensor->second.shape.end();
+                 ++t) {
+                kv_indices_offset *= *t;
+            };
+            size_t ite_indices_offset = ite * local_batch_size;
+            for (auto t = kv_indices_tensor->second.shape.begin() + 2;
+                 t != kv_indices_tensor->second.shape.end();
+                 ++t) {
+                ite_indices_offset *= *t;
+            }
+            kv_indices_offset += ite_indices_offset;
+            self_attention_output_tensors.insert(
+                "kv_indices",
+                Tensor(MEMORY_GPU,
+                       TYPE_INT32,
+                       self_kv_indices_size,
+                       kv_indices_tensor->second.getPtrWithOffset<int32_t>(kv_indices_offset)));
+        }
 
         self_attention_layer_->forward(
             &self_attention_output_tensors, &self_attention_input_tensors, &layer_weight->self_attention_weights);

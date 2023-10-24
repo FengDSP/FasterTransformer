@@ -92,6 +92,7 @@ private:
                         size_t max_seq_len,
                         size_t memory_len,
                         size_t max_input_len,
+                        size_t important_kv_cache_size,
                         bool   is_return_context_cum_log_probs);
     void freeBuffer() override;
 
@@ -111,6 +112,7 @@ protected:
     int    step_;
     size_t session_len_;
     size_t memory_len_;
+    size_t important_kv_cache_size_;
     int*   tiled_total_padding_count_ = nullptr;
 
     T*       padded_embedding_kernel_;
@@ -139,6 +141,7 @@ protected:
     T*   key_cache_;
     T*   value_cache_;
     int* cache_indirections_[2] = {nullptr, nullptr};
+    int* kv_indices_ = nullptr;
 
     int* start_ids_buf_;
     int* end_ids_buf_;
