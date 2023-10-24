@@ -50,6 +50,7 @@ void fusedQKV_masked_attention_dispatch(const T*     qkv_buf,
                                         const int    rotary_embedding_dim,
                                         const bool   neox_rotary_style,
                                         const int    memory_max_len,
+                                        const int    session_len,
                                         const int*   prefix_prompt_lengths,
                                         const int    max_prefix_prompt_length,
                                         const int    max_input_len,
@@ -62,6 +63,8 @@ void fusedQKV_masked_attention_dispatch(const T*     qkv_buf,
                                         const int*   ia3_tasks,
                                         const T*     ia3_key_weights,
                                         const T*     ia3_value_weights,
+                                        const int    important_kv_cache_size,
+                                        int*         kv_indices,
                                         const float* qkv_scale_out,
                                         const float* attention_out_scale,
                                         const int    int8_mode,
@@ -105,6 +108,7 @@ void fusedQKV_masked_attention_dispatch(const T*     qkv_buf,
     params.batch_size               = inference_batch_size;
     params.beam_width               = beam_width;
     params.memory_max_len           = memory_max_len;
+    params.session_len              = session_len;
     params.prefix_prompt_lengths    = prefix_prompt_lengths;
     params.max_prefix_prompt_length = max_prefix_prompt_length;
     params.length_per_sample        = sequence_lengths;  // max_input_length + current output length
@@ -129,6 +133,8 @@ void fusedQKV_masked_attention_dispatch(const T*     qkv_buf,
         params.linear_bias_slopes = reinterpret_cast<const DataType*>(linear_bias_slopes);
     }
     params.max_input_length = max_input_len;
+    params.important_kv_cache_size = important_kv_cache_size;
+    params.kv_indices = kv_indices;
 
     params.ia3_tasks         = ia3_tasks;
     params.ia3_key_weights   = reinterpret_cast<const DataType*>(ia3_key_weights);
@@ -163,6 +169,7 @@ void fusedQKV_masked_attention_dispatch(const T*     qkv_buf,
                                                      const int    rotary_embedding_dim,                                \
                                                      const bool   neox_rotary_style,                                   \
                                                      const int    memory_max_len,                                      \
+                                                     const int    session_len,                                         \
                                                      const int*   prefix_prompt_lengths,                               \
                                                      const int    max_prefix_prompt_length,                            \
                                                      const int    max_input_len,                                       \
@@ -175,6 +182,8 @@ void fusedQKV_masked_attention_dispatch(const T*     qkv_buf,
                                                      const int*   ia3_tasks,                                           \
                                                      const T*     ia3_key_weights,                                     \
                                                      const T*     ia3_value_weights,                                   \
+                                                     const int    important_kv_cache_size,                             \
+                                                     int*         kv_indices,                                          \
                                                      const float* qkv_scale_out,                                       \
                                                      const float* attention_out_scale,                                 \
                                                      const int    int8_mode,                                           \
@@ -467,18 +476,20 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
     //      finished [batch_size] (optional)
     //      total_padding_tokens [batch_size] (optional)
     //      max_input_length [1] on cpu (optional)
-    //      masked_tokens [batch_size, memory_len], (optional)
+    //      masked_tokens [batch_size, session_len], (optional)
     //      cache_indirection [batch_size / beam_width, beam_width, memory_max_len] (optional)
     //      d_prefix_prompt_lengths [batch_size] (optional)
     //      max_prefix_prompt_length [1] on cpu (optional)
     //      relative_attention_bias [1, head_num, step, step] or [1, head_num, max_seq_len, max_seq_len] (optional)
     //      linear_bias_slopes [head_num] (optional)
     //      ia3_tasks [batch_size] (optional)
+    //      important_kv_cache_size [1] on cpu (optional)
 
     // output tensors:
     //      attention_output [batch_size, d_model_],
     //      key_cache [batch, local_head_num, size_per_head // x, memory_max_len, x]
     //      value_cache [batch, local_head_num, memory_max_len, size_per_head]
+    //      kv_indices [batch, local_head_num, memory_max_len] (optional)
 
     FT_LOG_DEBUG(__PRETTY_FUNCTION__);
     FT_CHECK(output_tensors->at("key_cache").shape.size() == 5 || output_tensors->at("key_cache").shape.size() == 3);
@@ -496,14 +507,20 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
         input_tensors->isExist("relative_attention_bias") ? input_tensors->at("relative_attention_bias").shape[3] : 0;
     const T*   linear_bias_slopes = input_tensors->getPtr<T>("linear_bias_slopes", nullptr);
     const bool has_ia3            = input_tensors->isExist("ia3_tasks");
+    const int  important_kv_cache_size  = input_tensors->getVal<int>("important_kv_cache_size", 0);
 
     T* attention_out = output_tensors->getPtr<T>("hidden_features");
     T* key_cache     = output_tensors->getPtr<T>("key_cache");
     T* value_cache   = output_tensors->getPtr<T>("value_cache");
+    int* kv_indices  = output_tensors->getPtr<int>("kv_indices", nullptr);
 
     const int batch_size     = input_tensors->at("input_query").shape[0];
     const int beam_width     = cache_indir != nullptr ? input_tensors->at("cache_indirection").shape[1] : 1;
     const int memory_max_len = output_tensors->at("key_cache").shape[3];
+    if (kv_indices != nullptr) {
+        FT_CHECK(output_tensors->at("kv_indices").shape[2] == memory_max_len);
+    }
+    const int session_len    = masked_tokens != nullptr ? input_tensors->at("masked_tokens").shape[1] : 0;
 
     const int* d_prefix_prompt_lengths  = input_tensors->getPtr<int>("d_prefix_prompt_lengths", nullptr);
     const int  max_prefix_prompt_length = input_tensors->getVal<int>("max_prefix_prompt_length", 0);
@@ -596,6 +613,7 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
         rotary_embedding_dim_,
         neox_rotary_style_,
         memory_max_len,
+        session_len,
         d_prefix_prompt_lengths,
         max_prefix_prompt_length,
         input_tensors->getVal<int>("max_input_length", 0),
@@ -608,6 +626,8 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
         input_tensors->getPtr<int>("ia3_tasks", nullptr),
         has_ia3 ? attention_weights->ia3_key_weight.kernel : nullptr,
         has_ia3 ? attention_weights->ia3_value_weight.kernel : nullptr,
+        important_kv_cache_size,
+        kv_indices,
         int8_mode_ == 2 ? attention_weights->query_weight.scale_out : nullptr,
         int8_mode_ == 2 ? attention_weights->attention_output_weight.scale : nullptr,
         int8_mode_,

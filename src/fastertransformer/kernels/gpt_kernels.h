@@ -25,6 +25,11 @@
 
 namespace fastertransformer {
 
+void invokeInitiateIndices(int*         kv_indices,
+                           const int    loop_size,
+                           const size_t total_length,
+                           cudaStream_t stream);
+
 template<typename T>
 struct inputIdsEmbeddingLookupPosEncodingSoftPromptParam {
     T*           from_tensor;

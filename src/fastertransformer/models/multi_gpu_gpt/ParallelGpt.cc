@@ -98,6 +98,7 @@ void ParallelGpt<T>::allocateBuffer(size_t batch_size,
                                     size_t max_session_len,
                                     size_t memory_len,
                                     size_t max_input_len,
+                                    size_t important_kv_cache_size,
                                     bool   is_return_context_cum_log_probs)
 {
     FT_LOG_DEBUG(__PRETTY_FUNCTION__);
@@ -138,6 +139,11 @@ void ParallelGpt<T>::allocateBuffer(size_t batch_size,
             (int*)(allocator_->reMalloc(cache_indirections_[0], sizeof(int) * batchxbeam * memory_len * 2, true));
         cache_indirections_[1] = cache_indirections_[0] + batchxbeam * memory_len;
     }
+    if (important_kv_cache_size > 0) {
+        const size_t self_kv_index_size =
+            (num_layer_ / pipeline_para_.world_size_) * batchxbeam * local_head_num_ * memory_len;
+        kv_indices_ = (int*)(allocator_->reMalloc(kv_indices_, sizeof(int) * self_kv_index_size, true));
+    }
 
     tiled_input_ids_buf_ =
         (int*)(allocator_->reMalloc(tiled_input_ids_buf_, sizeof(int) * batchxbeam * max_session_len, true));
@@ -158,7 +164,7 @@ void ParallelGpt<T>::allocateBuffer(size_t batch_size,
     parent_ids_buf_ = (int*)(allocator_->reMalloc(parent_ids_buf_, sizeof(int) * batchxbeam * max_session_len, true));
     seq_limit_len_  = (uint32_t*)(allocator_->reMalloc(seq_limit_len_, sizeof(uint32_t) * batch_size, false));
     tiled_masked_tokens_ =
-        (bool*)(allocator_->reMalloc(tiled_masked_tokens_, sizeof(bool) * batchxbeam * memory_len, true));
+        (bool*)(allocator_->reMalloc(tiled_masked_tokens_, sizeof(bool) * batchxbeam * max_session_len, true));
 
     context_decoder_input_buf_  = (T*)(allocator_->reMalloc(
         context_decoder_input_buf_, sizeof(T) * batchxbeam * max_input_len * hidden_units_, false));
@@ -223,6 +229,9 @@ void ParallelGpt<T>::freeBuffer()
         allocator_->free((void**)(&key_cache_));
         if (cache_indirections_[0] != nullptr) {
             allocator_->free((void**)(&cache_indirections_)[0]);
+        }
+        if (kv_indices_ != nullptr) {
+            allocator_->free((void**)(&kv_indices_));
         }
 
         allocator_->free((void**)(&tiled_input_ids_buf_));
@@ -607,6 +616,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
     //      top_p_decay [batch_size] on gpu, float, optional
     //      top_p_min [batch_size] on gpu, float, optional
     //      top_p_reset_ids [batch_size] on gpu, uint32, optional
+    //      important_kv_cache_size [1] on cpu, uint32, optional
 
     // output_tensors:
     //      output_ids [batch_size, beam_width, max_output_seq_len]
@@ -730,6 +740,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
     const size_t gen_len          = input_tensors->at("output_seq_len").max<uint32_t>() + limit_len_offset;
 
     size_t session_len = 0;
+
     if (continue_gen) {
         session_len = session_len_;  // Record the size of allocated buffer in previous round.
     }
@@ -741,8 +752,10 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
     }
     session_len_ = session_len;
     FT_CHECK_WITH_INFO(
-        gen_len + initial_step <= session_len,
-        fmtstr("Session size too low (%d) vs. total output size (%d)", session_len, gen_len + initial_step));
+        gen_len <= session_len,
+        fmtstr("Session size too low (%d) vs. total output size (%d).",
+               session_len, gen_len)
+    );
     size_t memory_len = 0;
     if (continue_gen) {
         memory_len = memory_len_;  // Record the size of allocated buffer in previous round.
@@ -755,8 +768,23 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
     }
     memory_len_ = memory_len;
     /* TODO: could remove this constraint by changing how context decoder operates */
-    FT_CHECK_WITH_INFO(max_input_length <= memory_len,
+    FT_CHECK_WITH_INFO(continue_gen || max_input_length <= memory_len,
                        fmtstr("Memory size too low (%d) vs. input length (%d)", memory_len, max_input_length));
+
+    size_t important_kv_cache_size = 0;
+    if (continue_gen) {
+        important_kv_cache_size = important_kv_cache_size_;
+    } else if (input_tensors->find("important_kv_cache_size") != input_tensors->end()) {
+        important_kv_cache_size = input_tensors->at("important_kv_cache_size").getVal<uint32_t>();
+    }
+    if (important_kv_cache_size > memory_len) {
+        FT_LOG_WARNING("important_kv_cache_size (%d) is less than memory_len (%d). "
+                       "Setting important_kv_cache_size to memory_len.",
+                       important_kv_cache_size,
+                       memory_len);
+        important_kv_cache_size = memory_len;
+    }
+    important_kv_cache_size_ = important_kv_cache_size;
 
     if (memory_len < session_len) {
         FT_LOG_WARNING("memory_len (%d) is less than session_len (%d). "
@@ -796,6 +824,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
                        session_len,
                        memory_len,
                        max_input_length + max_prefix_soft_prompt_length,
+                       important_kv_cache_size,
                        is_return_context_cum_log_probs);
         sync_check_cuda_error();
     }
@@ -827,6 +856,14 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
     if (gpt_variant_params_.use_attention_linear_bias) {
         PUSH_RANGE("build alibi slopes");
         invokeBuildAlibiSlopes(linear_bias_slopes_, head_num_, stream_);
+        POP_RANGE;
+    }
+
+    if (important_kv_cache_size > 0) {
+        PUSH_RANGE("initiate indices");
+        const size_t indices_length = (num_layer_ / pipeline_para_.world_size_) * batch_size * beam_width
+                                      * local_head_num_ * memory_len;
+        invokeInitiateIndices(kv_indices_, memory_len, indices_length, stream_);
         POP_RANGE;
     }
 
@@ -865,7 +902,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
         PUSH_RANGE("initialize output and parent ids");
         cudaMemsetAsync(output_ids_buf_, 0, sizeof(int) * batch_size * beam_width * session_len, stream_);
         cudaMemsetAsync(parent_ids_buf_, 0, sizeof(int) * batch_size * beam_width * session_len, stream_);
-        cudaMemsetAsync(tiled_masked_tokens_, false, sizeof(bool) * batch_size * beam_width * memory_len, stream_);
+        cudaMemsetAsync(tiled_masked_tokens_, false, sizeof(bool) * batch_size * beam_width * session_len, stream_);
         cudaMemsetAsync(tiled_total_padding_count_, 0, sizeof(int) * batch_size * beam_width, stream_);
         if (beam_width > 1) {
             cudaMemsetAsync(cache_indirections_[0], 0, 2 * sizeof(int) * batch_size * beam_width * memory_len, stream_);
@@ -1180,7 +1217,7 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
     PUSH_RANGE("mask padding tokens");
     invokeMaskPaddingTokens(tiled_masked_tokens_,
                             input_tensors->at("input_lengths").getPtr<int>(),
-                            memory_len,
+                            session_len,
                             max_input_length,
                             initial_step,
                             batch_size,
@@ -1316,8 +1353,9 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
                      {"masked_tokens",
                       Tensor(MEMORY_GPU,
                              TYPE_BOOL,
-                             {local_batch_size * beam_width, memory_len},
-                             tiled_masked_tokens_ + id_offset * memory_len)}});
+                             {local_batch_size * beam_width, session_len},
+                             tiled_masked_tokens_ + id_offset * session_len)},
+                      {"important_kv_cache_size", Tensor(MEMORY_CPU, TYPE_UINT32, {1}, &important_kv_cache_size)}});
                 if (beam_width > 1) {
                     decoder_input_tensors.insert({"cache_indirection",
                                                   Tensor(MEMORY_GPU,
@@ -1342,6 +1380,16 @@ void ParallelGpt<T>::forward(std::unordered_map<std::string, Tensor>*       outp
                              decoder_output_buf_ + hidden_units_offset)},
                      {"key_cache", Tensor(MEMORY_GPU, data_type, self_k_cache_shape, key_cache_)},
                      {"value_cache", Tensor(MEMORY_GPU, data_type, self_v_cache_shape, value_cache_)}});
+                if (important_kv_cache_size > 0) {
+                    decoder_output_tensors.insert({"kv_indices",
+                                                   Tensor(MEMORY_GPU,
+                                                          TYPE_UINT32,
+                                                          {num_layer_ / pipeline_para_.world_size_,
+                                                           local_batch_size * beam_width,
+                                                           local_head_num_,
+                                                           memory_len},
+                                                          kv_indices_)});
+                }
 
                 gpt_decoder_->forward(
                     &decoder_output_tensors, &decoder_input_tensors, &gpt_weights->decoder_layer_weights);

@@ -172,6 +172,8 @@ public:
                                                                   (const int*)nullptr,        //  ia3 tasks
                                                                   (const DataType_*)nullptr,  //  ia3 key weights
                                                                   (const DataType_*)nullptr,  //  ia3 value weights
+                                                                  0,                          //  important_kv_cache_size
+                                                                  (int*)nullptr,              //  kv_indices
                                                                   (const float*)nullptr,      // int8 scale in
                                                                   (const float*)nullptr,      // int8 scale out
                                                                   0,                          // int8 mode
